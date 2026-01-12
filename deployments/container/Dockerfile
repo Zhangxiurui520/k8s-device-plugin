@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG GOLANG_VERSION=1.22.6
-FROM nvcr.io/nvidia/cuda:12.8.0-base-ubi9 AS build
+FROM registry.nscc-tj.cn/nvidia/cuda:12.8.0-base-ubi9 AS build
 
 RUN yum install -y \
     wget make git gcc \
@@ -45,13 +45,13 @@ ARG GIT_COMMIT="unknown"
 RUN make PREFIX=/artifacts cmds
 
 # We use the ubi9-minimal image as a reference image in removing unneeded dependencies.
-FROM redhat/ubi9-minimal:latest AS minimal
+FROM registry.nscc-tj.cn/nvidia/redhat/ubi9-minimal:latest AS minimal
 
 RUN rpm -qa --queryformat='^%{NAME}-\[0-9\].*\.%{ARCH}$\n' | sort -u > /tmp/package-names.minimal
 RUN rpm -qa | sort -u > /tmp/package-list.minimal
 
 # We define the following image as a base image and remove unneeded packages.
-FROM nvcr.io/nvidia/cuda:12.8.0-base-ubi9 AS base
+FROM registry.nscc-tj.cn/nvidia/cuda:12.8.0-base-ubi9 AS base
 
 WORKDIR /cleanup
 

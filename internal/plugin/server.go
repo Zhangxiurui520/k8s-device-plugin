@@ -64,7 +64,8 @@ type nvidiaDevicePlugin struct {
 
 	imexChannels imex.Channels
 
-	mps mpsOptions
+	mps          mpsOptions
+	deviceUpdate chan struct{}
 }
 
 // devicePluginForResource creates a device plugin for the specified resource.
@@ -107,6 +108,7 @@ func (plugin *nvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	plugin.health = make(chan *rm.Device)
 	plugin.stop = make(chan interface{})
+	plugin.deviceUpdate = make(chan struct{}, 1)
 }
 
 func (plugin *nvidiaDevicePlugin) cleanup() {
@@ -114,6 +116,7 @@ func (plugin *nvidiaDevicePlugin) cleanup() {
 	plugin.server = nil
 	plugin.health = nil
 	plugin.stop = nil
+	plugin.deviceUpdate = nil
 }
 
 // Devices returns the full set of devices associated with the plugin.
@@ -277,7 +280,41 @@ func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.D
 			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
 				return nil
 			}
+		case <-plugin.deviceUpdate:
+			klog.Info("Device list updated, sending new ListAndWatch response")
+			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
+				return nil
+			}
 		}
+	}
+}
+
+// HandleAllowedDeviceIDs filters the plugin's device list to the provided UUIDs and notifies ListAndWatch.
+func (plugin *nvidiaDevicePlugin) HandleAllowedDeviceIDs(uuids []string) {
+	if plugin == nil || plugin.rm == nil {
+		return
+	}
+	allowed := make(map[string]bool)
+	for _, u := range uuids {
+		// normalize: strip optional prefix like "hami-core:" if present
+		if strings.HasPrefix(u, "hami-core:") {
+			u = strings.TrimPrefix(u, "hami-core:")
+		}
+		allowed[u] = true
+	}
+
+	current := plugin.rm.Devices()
+	newSet := make(rm.Devices)
+	for id, d := range current {
+		if allowed[d.GetUUID()] {
+			newSet[id] = d
+		}
+	}
+
+	plugin.rm.UpdateDevices(newSet)
+	select {
+	case plugin.deviceUpdate <- struct{}{}:
+	default:
 	}
 }
 

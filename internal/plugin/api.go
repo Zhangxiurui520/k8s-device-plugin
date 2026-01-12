@@ -23,4 +23,7 @@ type Interface interface {
 	Devices() rm.Devices
 	Start(string) error
 	Stop() error
+	// HandleAllowedDeviceIDs filters or updates the plugin's device set
+	// according to the provided list of allowed device UUIDs.
+	HandleAllowedDeviceIDs([]string)
 }

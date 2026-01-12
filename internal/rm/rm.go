@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
@@ -31,9 +32,10 @@ import (
 
 // resourceManager forms the base type for specific resource manager implementations
 type resourceManager struct {
-	config   *spec.Config
-	resource spec.ResourceName
-	devices  Devices
+	config    *spec.Config
+	resource  spec.ResourceName
+	devices   Devices
+	devicesMu sync.RWMutex
 }
 
 // ResourceManager provides an interface for listing a set of Devices and checking health on them
@@ -44,6 +46,8 @@ type ResourceManager interface {
 	GetPreferredAllocation(available, required []string, size int) ([]string, error)
 	CheckHealth(stop <-chan interface{}, unhealthy chan<- *Device) error
 	ValidateRequest(AnnotatedIDs) error
+	// UpdateDevices replaces the internal device map with the provided set.
+	UpdateDevices(Devices)
 }
 
 // Resource gets the resource name associated with the ResourceManager
@@ -53,7 +57,25 @@ func (r *resourceManager) Resource() spec.ResourceName {
 
 // Devices gets the devices managed by the ResourceManager
 func (r *resourceManager) Devices() Devices {
-	return r.devices
+	r.devicesMu.RLock()
+	defer r.devicesMu.RUnlock()
+	copy := make(Devices, len(r.devices))
+	for k, v := range r.devices {
+		copy[k] = v
+	}
+	return copy
+}
+
+// UpdateDevices replaces the internal devices map in a thread-safe manner.
+func (r *resourceManager) UpdateDevices(devices Devices) {
+	r.devicesMu.Lock()
+	defer r.devicesMu.Unlock()
+	// make a copy to own the slice/map
+	newCopy := make(Devices, len(devices))
+	for k, v := range devices {
+		newCopy[k] = v
+	}
+	r.devices = newCopy
 }
 
 var errInvalidRequest = errors.New("invalid request")

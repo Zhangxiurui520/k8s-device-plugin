@@ -17,11 +17,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +33,9 @@ import (
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
@@ -380,6 +386,68 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 	if started == 0 {
 		klog.Info("No devices found. Waiting indefinitely.")
 	}
+
+	// Start a simple node-annotation watcher that polls the Node and parses
+	// the `hami.io/node-nvidia-register` annotation. When it changes,
+	// extract GPU UUID tokens (e.g. "GPU-..." or "hami-core:GPU-...") and
+	// notify all plugins via HandleAllowedDeviceIDs.
+	go func() {
+		cfg, err := rest.InClusterConfig()
+		if err != nil {
+			klog.Warningf("node-watcher: unable to build in-cluster config: %v; skipping annotation watcher", err)
+			return
+		}
+		cs, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			klog.Warningf("node-watcher: unable to create clientset: %v; skipping annotation watcher", err)
+			return
+		}
+
+		nodeName := os.Getenv("NODE_NAME")
+		if nodeName == "" {
+			hn, _ := os.Hostname()
+			nodeName = hn
+		}
+
+		re := regexp.MustCompile(`(?:hami-core:)?GPU-[0-9a-fA-F-]+`)
+		var lastAnn string
+		for {
+			ctx2, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			node, err := cs.CoreV1().Nodes().Get(ctx2, nodeName, metav1.GetOptions{})
+			cancel()
+			if err != nil {
+				klog.V(2).Infof("node-watcher: failed to get node %s: %v", nodeName, err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			ann := ""
+			if node.Annotations != nil {
+				if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
+					ann = v
+				}
+			}
+			if ann != lastAnn {
+				lastAnn = ann
+				matches := re.FindAllString(ann, -1)
+				seen := map[string]bool{}
+				var uuids []string
+				for _, m := range matches {
+					m = strings.TrimPrefix(m, "hami-core:")
+					if !seen[m] {
+						seen[m] = true
+						uuids = append(uuids, m)
+					}
+				}
+				klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
+				for _, p := range plugins {
+					// plugin.Interface now includes HandleAllowedDeviceIDs
+					p.HandleAllowedDeviceIDs(uuids)
+				}
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
 
 	return plugins, false, nil
 }

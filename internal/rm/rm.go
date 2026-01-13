@@ -33,7 +33,10 @@ import (
 type resourceManager struct {
 	config   *spec.Config
 	resource spec.ResourceName
-	devices  Devices
+	// allDevices contains the original set of devices discovered on the node.
+	// devices contains the currently-exposed (possibly filtered) devices.
+	allDevices Devices
+	devices    Devices
 }
 
 // ResourceManager provides an interface for listing a set of Devices and checking health on them
@@ -44,6 +47,9 @@ type ResourceManager interface {
 	GetPreferredAllocation(available, required []string, size int) ([]string, error)
 	CheckHealth(stop <-chan interface{}, unhealthy chan<- *Device) error
 	ValidateRequest(AnnotatedIDs) error
+	// HandleAllowedDeviceIDs updates the resource manager's view of devices
+	// based on the supplied list of GPU UUIDs (e.g. to exclude virtualized GPUs).
+	HandleAllowedDeviceIDs([]string)
 }
 
 // Resource gets the resource name associated with the ResourceManager
@@ -54,6 +60,32 @@ func (r *resourceManager) Resource() spec.ResourceName {
 // Devices gets the devices managed by the ResourceManager
 func (r *resourceManager) Devices() Devices {
 	return r.devices
+}
+
+// HandleAllowedDeviceIDs filters the set of devices exposed by the resource
+// manager based on the supplied UUID list. If the list is empty, the full
+// original device set is restored.
+func (r *resourceManager) HandleAllowedDeviceIDs(uuids []string) {
+	if r.allDevices == nil {
+		// nothing to do
+		return
+	}
+	if len(uuids) == 0 {
+		r.devices = r.allDevices
+		return
+	}
+	exclude := make(map[string]bool)
+	for _, u := range uuids {
+		exclude[u] = true
+	}
+	filtered := make(Devices)
+	for id, d := range r.allDevices {
+		if exclude[d.GetUUID()] {
+			continue
+		}
+		filtered[id] = d
+	}
+	r.devices = filtered
 }
 
 var errInvalidRequest = errors.New("invalid request")

@@ -23,4 +23,8 @@ type Interface interface {
 	Devices() rm.Devices
 	Start(string) error
 	Stop() error
+	// HandleAllowedDeviceIDs updates the plugin with a list of GPU UUIDs
+	// that should be considered by the plugin (the implementation may
+	// use this to exclude certain physical GPUs from reporting).
+	HandleAllowedDeviceIDs([]string)
 }

@@ -61,6 +61,7 @@ type nvidiaDevicePlugin struct {
 	server *grpc.Server
 	health chan *rm.Device
 	stop   chan interface{}
+	update chan struct{}
 
 	imexChannels imex.Channels
 
@@ -107,13 +108,16 @@ func (plugin *nvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	plugin.health = make(chan *rm.Device)
 	plugin.stop = make(chan interface{})
+	plugin.update = make(chan struct{})
 }
 
 func (plugin *nvidiaDevicePlugin) cleanup() {
 	close(plugin.stop)
+	close(plugin.update)
 	plugin.server = nil
 	plugin.health = nil
 	plugin.stop = nil
+	plugin.update = nil
 }
 
 // Devices returns the full set of devices associated with the plugin.
@@ -277,7 +281,24 @@ func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.D
 			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
 				return nil
 			}
+		case <-plugin.update:
+			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
+				return nil
+			}
 		}
+	}
+}
+
+// HandleAllowedDeviceIDs updates the resource manager with a list of GPU UUIDs
+// that should be excluded/considered by the plugin. This triggers an
+// immediate update to the ListAndWatch stream.
+func (plugin *nvidiaDevicePlugin) HandleAllowedDeviceIDs(uuids []string) {
+	// Update resource manager's device view
+	plugin.rm.HandleAllowedDeviceIDs(uuids)
+	// Trigger an update to ListAndWatch (non-blocking)
+	select {
+	case plugin.update <- struct{}{}:
+	default:
 	}
 }
 

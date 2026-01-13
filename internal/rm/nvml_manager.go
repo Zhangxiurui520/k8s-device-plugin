@@ -60,9 +60,10 @@ func NewNVMLResourceManagers(infolib info.Interface, nvmllib nvml.Interface, dev
 		}
 		r := &nvmlResourceManager{
 			resourceManager: resourceManager{
-				config:   config,
-				resource: resourceName,
-				devices:  devices,
+				config:     config,
+				resource:   resourceName,
+				allDevices: devices,
+				devices:    devices,
 			},
 			nvml: nvmllib,
 		}

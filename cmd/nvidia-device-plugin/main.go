@@ -17,7 +17,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,9 +32,12 @@ import (
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
@@ -387,10 +389,10 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 		klog.Info("No devices found. Waiting indefinitely.")
 	}
 
-	// Start a simple node-annotation watcher that polls the Node and parses
-	// the `hami.io/node-nvidia-register` annotation. When it changes,
-	// extract GPU UUID tokens (e.g. "GPU-..." or "hami-core:GPU-...") and
-	// notify all plugins via HandleAllowedDeviceIDs.
+	// Start a node-annotation watcher using informers. This listens for
+	// add/update/delete events for the current Node (filtered by name)
+	// and notifies plugins when the `hami.io/node-nvidia-register` annotation
+	// changes.
 	go func() {
 		cfg, err := rest.InClusterConfig()
 		if err != nil {
@@ -411,42 +413,83 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 
 		re := regexp.MustCompile(`(?:hami-core:)?GPU-[0-9a-fA-F-]+`)
 		var lastAnn string
-		for {
-			ctx2, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			node, err := cs.CoreV1().Nodes().Get(ctx2, nodeName, metav1.GetOptions{})
-			cancel()
-			if err != nil {
-				klog.V(2).Infof("node-watcher: failed to get node %s: %v", nodeName, err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
 
-			ann := ""
-			if node.Annotations != nil {
-				if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
-					ann = v
-				}
-			}
-			if ann != lastAnn {
-				lastAnn = ann
-				matches := re.FindAllString(ann, -1)
-				seen := map[string]bool{}
-				var uuids []string
-				for _, m := range matches {
-					m = strings.TrimPrefix(m, "hami-core:")
-					if !seen[m] {
-						seen[m] = true
-						uuids = append(uuids, m)
+		// Create informer factory restricted to this node by field selector.
+		factory := informers.NewSharedInformerFactoryWithOptions(cs, 0,
+			informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=" + nodeName
+			}))
+
+		nodeInf := factory.Core().V1().Nodes().Informer()
+
+		nodeInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				node := obj.(*corev1.Node)
+				ann := ""
+				if node.Annotations != nil {
+					if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
+						ann = v
 					}
 				}
-				klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
-				for _, p := range plugins {
-					// plugin.Interface now includes HandleAllowedDeviceIDs
-					p.HandleAllowedDeviceIDs(uuids)
+				if ann != lastAnn {
+					lastAnn = ann
+					matches := re.FindAllString(ann, -1)
+					seen := map[string]bool{}
+					var uuids []string
+					for _, m := range matches {
+						m = strings.TrimPrefix(m, "hami-core:")
+						if !seen[m] {
+							seen[m] = true
+							uuids = append(uuids, m)
+						}
+					}
+					klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs(uuids)
+					}
 				}
-			}
-			time.Sleep(2 * time.Second)
-		}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				node := newObj.(*corev1.Node)
+				ann := ""
+				if node.Annotations != nil {
+					if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
+						ann = v
+					}
+				}
+				if ann != lastAnn {
+					lastAnn = ann
+					matches := re.FindAllString(ann, -1)
+					seen := map[string]bool{}
+					var uuids []string
+					for _, m := range matches {
+						m = strings.TrimPrefix(m, "hami-core:")
+						if !seen[m] {
+							seen[m] = true
+							uuids = append(uuids, m)
+						}
+					}
+					klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs(uuids)
+					}
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				// Treat deletion as an empty annotation -> notify plugins to restore
+				if lastAnn != "" {
+					lastAnn = ""
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs([]string{})
+					}
+				}
+			},
+		})
+
+		stopCh := make(chan struct{})
+		factory.Start(stopCh)
+		factory.WaitForCacheSync(stopCh)
+		// Informer runs in background; return from goroutine and keep informer active.
 	}()
 
 	return plugins, false, nil

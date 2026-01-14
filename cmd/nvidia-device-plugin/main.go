@@ -17,7 +17,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,9 +34,10 @@ import (
 	"github.com/urfave/cli/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	watchapi "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
@@ -414,62 +414,82 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 		re := regexp.MustCompile(`(?:hami-core:)?GPU-[0-9a-fA-F-]+`)
 		var lastAnn string
 
-		// Use a watch on the Node resource filtered by node name.
-		for {
-			w, err := cs.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{
-				FieldSelector: "metadata.name=" + nodeName,
-			})
-			if err != nil {
-				klog.Warningf("node-watcher: failed to start watch for node %s: %v", nodeName, err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
+		// Create informer factory restricted to this node by field selector.
+		factory := informers.NewSharedInformerFactoryWithOptions(cs, 0,
+			informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=" + nodeName
+			}))
 
-			ch := w.ResultChan()
-			for ev := range ch {
-				switch ev.Type {
-				case watchapi.Added, watchapi.Modified:
-					node, ok := ev.Object.(*corev1.Node)
-					if !ok {
-						continue
+		nodeInf := factory.Core().V1().Nodes().Informer()
+
+		nodeInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				node := obj.(*corev1.Node)
+				ann := ""
+				if node.Annotations != nil {
+					if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
+						ann = v
 					}
-					ann := ""
-					if node.Annotations != nil {
-						if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
-							ann = v
-						}
-					}
-					if ann != lastAnn {
-						lastAnn = ann
-						matches := re.FindAllString(ann, -1)
-						seen := map[string]bool{}
-						var uuids []string
-						for _, m := range matches {
-							m = strings.TrimPrefix(m, "hami-core:")
-							if !seen[m] {
-								seen[m] = true
-								uuids = append(uuids, m)
-							}
-						}
-						klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
-						for _, p := range plugins {
-							p.HandleAllowedDeviceIDs(uuids)
-						}
-					}
-				case watchapi.Deleted:
-					if lastAnn != "" {
-						lastAnn = ""
-						for _, p := range plugins {
-							p.HandleAllowedDeviceIDs([]string{})
-						}
-					}
-				case watchapi.Error:
-					klog.Warningf("node-watcher: watch error for node %s", nodeName)
 				}
-			}
-			// Watch channel closed; retry after short delay.
-			time.Sleep(2 * time.Second)
-		}
+				if ann != lastAnn {
+					lastAnn = ann
+					matches := re.FindAllString(ann, -1)
+					seen := map[string]bool{}
+					var uuids []string
+					for _, m := range matches {
+						m = strings.TrimPrefix(m, "hami-core:")
+						if !seen[m] {
+							seen[m] = true
+							uuids = append(uuids, m)
+						}
+					}
+					klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs(uuids)
+					}
+				}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				node := newObj.(*corev1.Node)
+				ann := ""
+				if node.Annotations != nil {
+					if v, ok := node.Annotations["hami.io/node-nvidia-register"]; ok {
+						ann = v
+					}
+				}
+				if ann != lastAnn {
+					lastAnn = ann
+					matches := re.FindAllString(ann, -1)
+					seen := map[string]bool{}
+					var uuids []string
+					for _, m := range matches {
+						m = strings.TrimPrefix(m, "hami-core:")
+						if !seen[m] {
+							seen[m] = true
+							uuids = append(uuids, m)
+						}
+					}
+					klog.Infof("node-watcher: annotation changed, extracted GPUs=%v", uuids)
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs(uuids)
+					}
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				// Treat deletion as an empty annotation -> notify plugins to restore
+				if lastAnn != "" {
+					lastAnn = ""
+					for _, p := range plugins {
+						p.HandleAllowedDeviceIDs([]string{})
+					}
+				}
+			},
+		})
+
+		stopCh := make(chan struct{})
+		factory.Start(stopCh)
+		factory.WaitForCacheSync(stopCh)
+		// Informer runs in background; return from goroutine and keep informer active.
 	}()
 
 	return plugins, false, nil
